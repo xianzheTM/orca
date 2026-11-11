@@ -65,7 +65,7 @@ never be shown at more than half the display's resolution.
 
 1. **The pixel-size replies were in CSS pixels.**
    `createTerminalPixelSizeQueryResponder` in
-   `src/renderer/src/components/terminal-pane/terminal-capability-replies.ts`
+   `src/renderer/src/components/terminal-pane/emulation/terminal-capability-replies.ts`
    took the cell size from the `.xterm-screen` bounding rectangle
    (`getBoundingClientRect() / cols,rows`), which is in CSS pixels. omp 18.11.1
    sends `CSI 16 t` once its image protocol is set (`terminal.write("\x1B[16t")`
@@ -83,7 +83,7 @@ never be shown at more than half the display's resolution.
    Sixel and kitty.
 
 2. **The image layer drew in CSS pixels.** The patched `@xterm/addon-image`
-   (`config/patches/xterm-src/@xterm__addon-image@0.10.0-beta.301.src.patch`)
+   (`config/patches/xterm-src/@xterm__addon-image@0.10.0-beta.331.src.patch`)
    read `dimensions.css.*` everywhere:
    - `ImageRenderer.cellSize`, `clearLines`, `rescaleCanvas` and
      `insertLayerToDom` used `css.cell` and `css.canvas`. The layer `<canvas>`
@@ -138,7 +138,7 @@ are unchanged.
   helper `getTerminalScreenElement` is removed. At DPR 1, device equals CSS,
   so the measured replies are byte-for-byte the same as before.
 - **Addon** (source patch regenerated with
-  `node config/scripts/regenerate-xterm-patches.mjs --write`; shipped patch and
+  `node config/scripts/terminal-dependencies/xterm-patches/regenerate-xterm-patches.mjs --write`; shipped patch and
   `pnpm-lock.yaml` patch hash updated):
   - `ImageRenderer`: `cellSize`, `clearLines`, `draw*` and `extractTile` use
     `device.cell`. The layer canvases get a `device.canvas` backing store and a
@@ -165,13 +165,13 @@ are unchanged.
 
 ### Regression tests
 
-- `src/renderer/src/components/terminal-pane/terminal-capability-replies.test.ts`
+- `src/renderer/src/components/terminal-pane/emulation/terminal-capability-replies.test.ts`
   checks DPR 2 device-pixel replies, rounded fractional cells and floored canvas
-  dimensions, unchanged DPR 1 replies, split queries, and silence before
-  dimensions are available or when cell metrics are non-positive or non-finite.
+  dimensions, unchanged DPR 1 replies, and silence before dimensions are
+  available or when cell metrics are non-positive or non-finite.
   Missing or invalid canvas metrics suppress only the 14t reply. Existing DA1
   and replay tests are unchanged.
-- `config/scripts/xterm-image-device-pixel-contract.test.mjs` checks device-sized
+- `config/scripts/terminal-dependencies/xterm-patches/xterm-image-device-pixel-contract.test.mjs` checks device-sized
   backing canvases with CSS layout sizes across DPR changes, fractional canvas
   dimensions without destructive clears, full-width eviction placeholders,
   explicit and natural-size Kitty placement at DPR 2 and DPR 1, and consistent

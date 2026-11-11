@@ -8,6 +8,7 @@ import {
 } from './profile-cloud-client'
 import type { OrcaCloudSessionExchangeResponse } from './profile-cloud-session-exchange'
 import {
+  AMBIGUOUS_REFRESH_REPLAY_DELAY_MS,
   AmbiguousRefreshReplayBlockedError,
   blocksAmbiguousRefreshReplay,
   forgetAmbiguousRefreshAttempt,
@@ -36,9 +37,31 @@ function shouldRefreshCloudSession(session: OrcaCloudSession, now = Date.now()):
   return session.expiresAt <= now + CLOUD_SESSION_REFRESH_SKEW_MS
 }
 
-export function isOrcaCloudAuthFailure(error: unknown): boolean {
+// A 403 is a permission answer, never an expired token, so only a 401 may force a refresh.
+function isAccessTokenRejected(error: unknown): boolean {
+  return error instanceof OrcaCloudRequestError && error.statusCode === 401
+}
+
+// An operation that keeps answering 401 must not rotate the token on every call.
+const FORCED_REFRESH_BACKOFF_MS = 5 * 60_000
+const lastForcedRefreshAt = new Map<string, number>()
+
+function takeForcedRefreshSlot(key: string, now = Date.now()): boolean {
+  const last = lastForcedRefreshAt.get(key)
+  // A clock rollback must not stretch the backoff.
+  if (last !== undefined && now >= last && now - last < FORCED_REFRESH_BACKOFF_MS) {
+    return false
+  }
+  lastForcedRefreshAt.set(key, now)
+  return true
+}
+
+// Only the auth server's own verdict may discard a sign-in; proxies, outages and limits never do.
+function isRefreshTokenRejected(error: unknown): boolean {
   return (
-    error instanceof OrcaCloudRequestError && (error.statusCode === 401 || error.statusCode === 403)
+    error instanceof OrcaCloudRequestError &&
+    error.statusCode === 401 &&
+    error.errorCode === 'invalid_refresh_token'
   )
 }
 
@@ -59,23 +82,16 @@ function clearCloudSessionIfUnchanged(
     return
   }
   forgetAmbiguousRefreshAttempt(orcaCloudSessionKey(profileId, userDataPath))
-  // Why: the renderer cached auth status at startup; without this it keeps
-  // showing "Connected" until the app restarts.
+  // Invalidate the renderer’s cached Connected state immediately.
   emitOrcaCloudSessionInvalidated()
 }
 
-// Why: support cannot otherwise tell a genuine revocation from a sign-out we
-// caused ourselves by resending a refresh token whose first attempt never
-// answered. Never log the token itself.
+// Distinguish genuine revocation from ambiguous refresh replay without logging tokens.
 function warnIfPossibleRefreshReplay(
   profileId: string,
   userDataPath: string,
-  failed: OrcaCloudSession,
-  error: unknown
+  failed: OrcaCloudSession
 ): void {
-  if (!(error instanceof OrcaCloudRequestError) || error.statusCode !== 401) {
-    return
-  }
   const key = orcaCloudSessionKey(profileId, userDataPath)
   if (!wasRefreshTokenAmbiguouslyAttempted(key, failed.refreshToken)) {
     return
@@ -110,21 +126,18 @@ async function attemptCloudSessionRefresh(
       if (ambiguous) {
         recordAmbiguousRefreshAttempt(key, session.refreshToken)
       }
-      // Only a status line proves the server rejected this token without
-      // rotating it, so a definitive 5xx is the only failure worth retrying.
-      const retryable = !ambiguous && attempt === 0 && isRetryableCloudRefreshRejection(error)
-      if (!ambiguous && !retryable) {
+      if (attempt > 0 || (!ambiguous && !isRetryableCloudRefreshRejection(error))) {
         throw error
       }
-      // Another caller may have rotated the stored session while this attempt
-      // was in flight; that result is the one to use, and the token this attempt
-      // held is no longer ours to send again.
+      // An unanswered attempt may have rotated the token; replay it once while the server's
+      // rotation grace still returns the successor, instead of after the grace treats it as reuse.
+      if (ambiguous) {
+        await new Promise((resolve) => setTimeout(resolve, AMBIGUOUS_REFRESH_REPLAY_DELAY_MS))
+      }
+      // Reuse concurrent rotations instead of replaying the now-spent token.
       const current = readCloudSession(active.profile.id, userDataPath)
       if (current.status === 'found' && current.session.refreshToken !== session.refreshToken) {
         return { status: 'rotated-elsewhere', session: current.session }
-      }
-      if (ambiguous) {
-        throw error
       }
     }
   }
@@ -136,9 +149,7 @@ async function refreshStoredCloudSession(
   userDataPath: string,
   session: OrcaCloudSession
 ): Promise<OrcaCloudSession> {
-  // Why: refresh tokens rotate, so concurrent refreshes must single-flight;
-  // a second POST with the same refresh token can trip server reuse detection
-  // and revoke the whole token family.
+  // Single-flight rotating tokens: a duplicate POST can revoke the whole family.
   const key = orcaCloudSessionKey(active.profile.id, userDataPath)
   const inflight = inflightCloudSessionRefreshes.get(key)
   if (inflight) {
@@ -147,7 +158,6 @@ async function refreshStoredCloudSession(
   const task = (async () => {
     const current = readCloudSession(active.profile.id, userDataPath)
     if (current.status === 'found' && current.session.refreshToken !== session.refreshToken) {
-      // Another caller already rotated this session; reuse its result.
       return current.session
     }
     if (!active.profile.cloud) {
@@ -207,8 +217,8 @@ export async function readFreshOrcaCloudSession(
       session: await refreshStoredCloudSession(config, active, userDataPath, session.session)
     }
   } catch (error) {
-    if (isOrcaCloudAuthFailure(error)) {
-      warnIfPossibleRefreshReplay(active.profile.id, userDataPath, session.session, error)
+    if (isRefreshTokenRejected(error)) {
+      warnIfPossibleRefreshReplay(active.profile.id, userDataPath, session.session)
       clearCloudSessionIfUnchanged(active.profile.id, userDataPath, session.session)
       return { status: 'reconnect-required' }
     }
@@ -228,8 +238,8 @@ export async function forceRefreshOrcaCloudSession(
       session: await refreshStoredCloudSession(config, active, userDataPath, session)
     }
   } catch (error) {
-    if (isOrcaCloudAuthFailure(error)) {
-      warnIfPossibleRefreshReplay(active.profile.id, userDataPath, session, error)
+    if (isRefreshTokenRejected(error)) {
+      warnIfPossibleRefreshReplay(active.profile.id, userDataPath, session)
       clearCloudSessionIfUnchanged(active.profile.id, userDataPath, session)
       return { status: 'reconnect-required' }
     }
@@ -250,7 +260,15 @@ export async function runWithFreshOrcaCloudSession<T>(
   try {
     return { status: 'ok', value: await operation(session.session) }
   } catch (error) {
-    if (!isOrcaCloudAuthFailure(error)) {
+    if (!isAccessTokenRejected(error)) {
+      throw error
+    }
+    // Reuse a rotation that already happened or is in flight; start a new one only once per backoff.
+    const key = orcaCloudSessionKey(active.profile.id, userDataPath)
+    const stored = readCloudSession(active.profile.id, userDataPath)
+    const rotatedSince =
+      stored.status === 'found' && stored.session.refreshToken !== session.session.refreshToken
+    if (!rotatedSince && !inflightCloudSessionRefreshes.has(key) && !takeForcedRefreshSlot(key)) {
       throw error
     }
     const refreshed = await forceRefreshOrcaCloudSession(
@@ -262,18 +280,7 @@ export async function runWithFreshOrcaCloudSession<T>(
     if (refreshed.status !== 'found') {
       return { status: 'reconnect-required' }
     }
-    try {
-      return { status: 'ok', value: await operation(refreshed.session) }
-    } catch (retryError) {
-      // Why: a 401 after a successful refresh means the session itself is
-      // rejected. A 403 is an authorization (permission) failure — signing
-      // the user out for it would destroy a valid session, so let it surface
-      // as a failed operation instead.
-      if (retryError instanceof OrcaCloudRequestError && retryError.statusCode === 401) {
-        clearCloudSessionIfUnchanged(active.profile.id, userDataPath, refreshed.session)
-        return { status: 'reconnect-required' }
-      }
-      throw retryError
-    }
+    // The auth server just accepted this session, so a second rejection is the operation's error.
+    return { status: 'ok', value: await operation(refreshed.session) }
   }
 }

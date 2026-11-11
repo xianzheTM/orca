@@ -4,11 +4,22 @@ import { enqueueWrite } from './primary-state-writes'
 import type { ExecutionHostId } from '../../../shared/execution-host'
 import {
   notifyWorkspaceSessionWritten,
+  type WorkspaceSessionOperationListener,
   type WorkspaceSessionWriteListener
 } from './workspace-session-write-listeners'
+import { ptyBindingGenerationOf } from './pty-binding-generations'
+import type { PartitionEditorViews } from './layout-editor-views'
+import type { WorktreeMeta } from '../../../shared/worktree/meta-types'
 
-/** Gets the domains a write changed; undefined when it may have changed any of them. */
+/** Undefined means any domain may have changed. */
 export type StateWriteListener = (dirtyDomains: readonly string[] | undefined) => void
+/** One host's worktree metadata row before and after a write. */
+export type WorktreeMetaWriteListener = (write: {
+  worktreeId: string
+  hostId: ExecutionHostId
+  previous: WorktreeMeta | undefined
+  next: WorktreeMeta
+}) => void
 
 const SAVE_DEBOUNCE_MS = 1_000
 const SAVE_MAX_WAIT_MS = 5_000
@@ -26,7 +37,13 @@ type WriteSchedulingOperationsRuntime = Pick<
   | 'writeTimer'
   | 'writesFrozen'
   | 'workspaceSessionWriteListeners'
+  | 'workspaceSessionOperationListeners'
   | 'stateWriteListeners'
+  | 'worktreeMetaWriteListeners'
+  | 'workspaceMetadataCursor'
+  | 'ptyBindingGenerations'
+  | 'layoutEditorViews'
+  | 'state'
 >
 
 const writeSchedulingOperationsContext = Symbol('WriteSchedulingOperations')
@@ -47,7 +64,7 @@ export class WriteSchedulingOperations {
     await Promise.all([runtime.pendingWrite, runtime.activeViewPreference.waitForPendingWrite()])
   }
 
-  /** Called after each in-memory workspace-session write; listeners must not throw or block. */
+  /** Observe in-memory session writes; callbacks must not throw or block. */
   onWorkspaceSessionWritten(listener: WorkspaceSessionWriteListener): () => void {
     const { runtime } = this[writeSchedulingOperationsContext]
     runtime.workspaceSessionWriteListeners.add(listener)
@@ -56,7 +73,24 @@ export class WriteSchedulingOperations {
     }
   }
 
-  /** Called after each in-memory write that schedules a save; listeners must not throw or block. */
+  /** Main-owned layouts notify once after all declared partitions; callbacks must not throw or block. */
+  onWorkspaceSessionOperationEnded(listener: WorkspaceSessionOperationListener): () => void {
+    const { runtime } = this[writeSchedulingOperationsContext]
+    runtime.workspaceSessionOperationListeners.add(listener)
+    return () => {
+      runtime.workspaceSessionOperationListeners.delete(listener)
+    }
+  }
+
+  getPtyBindingGeneration(hostId: ExecutionHostId, leafId: string): number | undefined {
+    return ptyBindingGenerationOf(this[writeSchedulingOperationsContext].runtime, hostId, leafId)
+  }
+
+  getLayoutEditorViews(hostId: ExecutionHostId): PartitionEditorViews | undefined {
+    return this[writeSchedulingOperationsContext].runtime.layoutEditorViews.get(hostId)
+  }
+
+  /** Observe save-scheduling writes; callbacks must not throw or block. */
   onStateWritten(listener: StateWriteListener): () => void {
     const { runtime } = this[writeSchedulingOperationsContext]
     runtime.stateWriteListeners.add(listener)
@@ -64,9 +98,30 @@ export class WriteSchedulingOperations {
       runtime.stateWriteListeners.delete(listener)
     }
   }
+
+  /** The workspaceMetadata position a listing records when it reads metadata. */
+  getWorkspaceMetadataCursor(): { epoch: string; seq: number } {
+    const { epoch, seq } = this[writeSchedulingOperationsContext].runtime.workspaceMetadataCursor
+    return { epoch, seq }
+  }
+
+  /** Advances the position for one published record; call in the same turn as its metadata write. */
+  advanceWorkspaceMetadataCursor(): { epoch: string; seq: number } {
+    const cursor = this[writeSchedulingOperationsContext].runtime.workspaceMetadataCursor
+    cursor.seq += 1
+    return { epoch: cursor.epoch, seq: cursor.seq }
+  }
+
+  /** Observe each host-qualified worktree metadata write; callbacks must not throw, block or write. */
+  onWorktreeMetaWritten(listener: WorktreeMetaWriteListener): () => void {
+    const { runtime } = this[writeSchedulingOperationsContext]
+    runtime.worktreeMetaWriteListeners.add(listener)
+    return () => {
+      runtime.worktreeMetaWriteListeners.delete(listener)
+    }
+  }
 }
 
-/** `writtenHostId` names the one session partition this save changed, if it changed only one. */
 export function scheduleSave(
   owner: WriteSchedulingOperations,
   dirtyDomains?: readonly string[],

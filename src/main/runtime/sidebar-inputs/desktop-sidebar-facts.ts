@@ -1,6 +1,7 @@
 import {
   LOCAL_EXECUTION_HOST_ID,
   getRepoExecutionHostId,
+  getSettingsFocusedExecutionHostId,
   normalizeExecutionHostOrder,
   toRuntimeExecutionHostId,
   toSshExecutionHostId,
@@ -8,14 +9,19 @@ import {
 } from '../../../shared/execution-host'
 import { applyManualRepoOrder } from '../../../shared/manual-repo-order'
 import type { DesktopSidebarFacts } from '../../../shared/sidebar-list/desktop-sidebar-facts'
+import type { GlobalSettings } from '../../../shared/global-settings-types'
+import { getHostDisplayLabelOverrides } from '../../../shared/host-setting-overrides'
 import type { SshConnectionState, SshTarget } from '../../../shared/ssh-types'
 import type { WslHostStatus } from '../../../shared/wsl-host-types'
 import type { PersistedUIState } from '../../../shared/persisted-ui-state-types'
-import type { WorkspaceSessionState } from '../../../shared/workspace-session-state-types'
+import type { WorkspaceSessionState } from '../../../shared/workspace-session/workspace-session-state-types'
 import { folderWorkspaceKey } from '../../../shared/workspace-scope'
 import { readAllWorktreeMetaForHost } from '../../persistence/host-qualified-worktree-meta'
-import type { RuntimeStore } from '../runtime-store-contract'
-import { runtimeVisibleFolderWorkspaces, runtimeVisibleRepos } from '../runtime-visible-catalog'
+import type { RuntimeStore } from '../construction/runtime-store-contract'
+import {
+  runtimeVisibleFolderWorkspaces,
+  runtimeVisibleRepos
+} from '../workspaces/catalog/runtime-visible-catalog'
 
 export type DesktopSidebarFactSources = {
   store: Pick<
@@ -31,12 +37,18 @@ export type DesktopSidebarFactSources = {
       hostId: ExecutionHostId
     ) => Pick<WorkspaceSessionState, 'activeWorktreeId' | 'activeWorkspaceExecutionHostId'>
     getUI?: () => Pick<PersistedUIState, 'manualRepoOrder' | 'workspaceHostOrder'>
+    getSettings?: () => Pick<
+      GlobalSettings,
+      'activeRuntimeEnvironmentId' | 'hostSettingOverrides' | 'showPinnedWorktreesInGroups'
+    >
   }
   /** The registry's list, which leaves out targets a paired server owns; the window lists the same. */
   sshTargets: readonly Pick<SshTarget, 'id' | 'label'>[]
   sshStateOf: (targetId: string) => Pick<SshConnectionState, 'status'> | undefined
   /** Empty where WSL hosts cannot exist. */
   wslStatuses: readonly Pick<WslHostStatus, 'environmentId' | 'distro' | 'state'>[]
+  /** This store's identity (host-descriptor.ts); absent until its file exists. */
+  installationId?: string
 }
 
 /** Read on demand: every fact already lives in this host's store or connection registries. */
@@ -45,6 +57,7 @@ export function readDesktopSidebarFacts(sources: DesktopSidebarFactSources): Des
   // Global session fields live on the local slice alone (workspace-session-host-field-ownership.ts).
   const session = store.getWorkspaceSession?.(LOCAL_EXECUTION_HOST_ID)
   const ui = store.getUI?.()
+  const settings = store.getSettings?.()
   const repos = runtimeVisibleRepos(store)
   const repoHostIds = new Set<ExecutionHostId>(repos.map((repo) => getRepoExecutionHostId(repo)))
 
@@ -84,6 +97,10 @@ export function readDesktopSidebarFacts(sources: DesktopSidebarFactSources): Des
         toRuntimeExecutionHostId(status.environmentId),
         { distro: status.distro, state: status.state }
       ])
-    )
+    ),
+    focusedHostId: getSettingsFocusedExecutionHostId(settings),
+    hostLabels: Object.fromEntries(getHostDisplayLabelOverrides(settings)),
+    showPinnedInGroups: settings?.showPinnedWorktreesInGroups === true,
+    ...(sources.installationId ? { installationId: sources.installationId } : {})
   }
 }

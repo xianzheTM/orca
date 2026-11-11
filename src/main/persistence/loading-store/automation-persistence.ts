@@ -1,28 +1,35 @@
+import type { Repo } from '../../../shared/repo-types'
+import type { HostWorktreeTarget } from '../../../shared/worktree/host-qualified-identity'
 import type {
   Automation,
   AutomationCreateInput,
+  AutomationUpdateInput
+} from '../../../shared/automations/automation-definition'
+import type {
   AutomationDispatchResult,
   AutomationRun,
-  AutomationRunTrigger,
-  AutomationUpdateInput
-} from '../../../shared/automations-types'
+  AutomationRunTrigger
+} from '../../../shared/automations/history/automation-run'
 import type {
   AutomationCapturedHostIssue,
   AutomationChangeSelector,
   AutomationListParams,
   AutomationListResult
-} from '../../../shared/automation-list-scope'
+} from '../../../shared/automations/ownership/automation-list-scope'
 import type {
   AutomationDestination,
   AutomationOwnerFenceOperation,
-  AutomationOwnerPrecondition
-} from '../../../shared/automation-owner-precondition'
+  AutomationOwnerPrecondition,
+  AutomationUpdatePreconditions
+} from '../../../shared/automations/ownership/automation-owner-precondition'
+import type { WorkspaceRunContext } from '../../../shared/work-items/task-source-context'
 import { getWorktreePathBasenameFromId } from '../../../shared/worktree/id'
 import { normalizeAutomationRunWorkspaceDisplayName } from '../scheduling-automations/automation-context-migration'
 import {
   createAutomation as createAutomationOperation,
   deleteAutomation as deleteAutomationOperation,
   listAutomations as listAutomationsOperation,
+  stampLegacyAutomationRunContext as stampLegacyAutomationRunContextOperation,
   updateAutomation as updateAutomationOperation,
   type AutomationDefinitionOperations
 } from '../scheduling-automations/automation-definition-operations'
@@ -37,6 +44,7 @@ import {
 } from '../scheduling-automations/automation-run-operations'
 import {
   advanceAutomationNextRun as advanceAutomationNextRunOperation,
+  disableAutomations as disableAutomationsOperation,
   getLatestAutomationOccurrence as getLatestAutomationOccurrenceOperation
 } from '../scheduling-automations/automation-schedule-operations'
 import {
@@ -50,6 +58,7 @@ import {
 import type { StoreRuntimeState } from './store-runtime-state'
 import type { WriteFlushBarrierOperations } from './write-flush-barriers'
 import type { ProfilePreferences } from './profile-preferences'
+import { AutomationEnablementTransitions } from './automation-enablement-transitions'
 
 type AutomationPersistenceRuntime = Pick<
   StoreRuntimeState,
@@ -61,6 +70,7 @@ type AutomationPersistenceRuntime = Pick<
 >
 
 const automationPersistenceContext = Symbol('AutomationPersistence')
+const automationEnablement = Symbol('AutomationEnablement')
 type AutomationPersistenceContext = {
   runtime: AutomationPersistenceRuntime
   flushBarriers: WriteFlushBarrierOperations
@@ -69,6 +79,7 @@ type AutomationPersistenceContext = {
 
 export class AutomationPersistence {
   readonly [automationPersistenceContext]: AutomationPersistenceContext
+  readonly [automationEnablement] = new AutomationEnablementTransitions()
 
   constructor(
     runtime: AutomationPersistenceRuntime,
@@ -141,7 +152,7 @@ export class AutomationPersistence {
 
   createAutomation(
     input: AutomationCreateInput,
-    options?: { destination?: AutomationDestination }
+    options?: { destination?: AutomationDestination; resolvedRepo?: Repo }
   ): Automation {
     return createAutomationOperation(getAutomationDefinitionOperations(this), input, options)
   }
@@ -149,9 +160,25 @@ export class AutomationPersistence {
   updateAutomation(
     id: string,
     updates: AutomationUpdateInput,
-    options?: { expectedOwner?: AutomationOwnerPrecondition; destination?: AutomationDestination }
+    options?: AutomationUpdatePreconditions & { resolvedRepo?: Repo }
   ): Automation {
-    return updateAutomationOperation(getAutomationDefinitionOperations(this), id, updates, options)
+    const stored = this[automationPersistenceContext].runtime.state.automations ?? []
+    return this[automationEnablement].track(stored, id, () =>
+      updateAutomationOperation(getAutomationDefinitionOperations(this), id, updates, options)
+    )
+  }
+
+  /** Changes when an update pauses or re-enables the automation, never on run bookkeeping. */
+  automationEnablementRevision(id: string): number {
+    return this[automationEnablement].revision(id)
+  }
+
+  stampLegacyAutomationRunContext(automationId: string, runContext: WorkspaceRunContext): boolean {
+    return stampLegacyAutomationRunContextOperation(
+      getAutomationDefinitionOperations(this),
+      automationId,
+      runContext
+    )
   }
 
   deleteAutomation(id: string, options?: { expectedOwner?: AutomationOwnerPrecondition }): void {
@@ -188,10 +215,13 @@ export class AutomationPersistence {
     return updateAutomationRunOperation(getAutomationRunOperations(this), result)
   }
 
-  snapshotAutomationRunWorkspaceDisplayName(workspaceId: string, displayName: string): number {
+  snapshotAutomationRunWorkspaceDisplayName(
+    target: HostWorktreeTarget,
+    displayName: string
+  ): number {
     return snapshotAutomationRunWorkspaceDisplayNameOperation(
       getAutomationRunOperations(this),
-      workspaceId,
+      target,
       displayName
     )
   }
@@ -205,6 +235,17 @@ export class AutomationPersistence {
       },
       id,
       now
+    )
+  }
+
+  disableAutomations(ids: ReadonlySet<string>): number {
+    return disableAutomationsOperation(
+      this[automationPersistenceContext].runtime.state,
+      () => {
+        markAutomationDefinitionDomain(this)
+        this[automationPersistenceContext].flushBarriers.flush()
+      },
+      ids
     )
   }
 

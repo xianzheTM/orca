@@ -22,7 +22,7 @@ vi.mock('electron', () => ({
   BrowserWindow: { getAllWindows: () => [] }
 }))
 vi.mock('../telemetry/client', () => ({ track: vi.fn() }))
-vi.mock('../ssh/ssh-config-parser', () => ({
+vi.mock('../ssh/config/ssh-config-parser', () => ({
   loadUserSshConfig: () => ({ hosts: [] }),
   sshConfigHostsToTargets: () => []
 }))
@@ -153,5 +153,5 @@ it('keeps a title-only change without arming a save, and writes it with the next
   // Another domain's save writes only the domains marked dirty, which must include this one.
   store.updateSettings({ opencodeSessionCookie: 'cookie' })
   store.flushOrThrow()
-  expect(open().getRemoteLayoutSnapshot('env')?.workspaces[workspace.worktree]).toEqual(retitled)
+  expect(open().getRemoteLayoutSnapshots().env?.workspaces[workspace.worktree]).toEqual(retitled)
 })
